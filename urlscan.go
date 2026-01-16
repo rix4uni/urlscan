@@ -40,29 +40,66 @@ func runLoop() {
 	fmt.Printf("[*] Starting URLScan auto-scraper (every %d seconds)...\n", *interval)
 	fmt.Printf("[*] Output file: %s\n\n", *outputFile)
 
+	// Create Chrome allocator once - browser process stays open for entire loop
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+	)
+
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
+	defer cancelAlloc()
+
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	// Run scraper in a goroutine
 	go func() {
-		for {
-			if err := scrapeAndSave(); err != nil {
+		ticker := time.NewTicker(time.Duration(*interval) * time.Second)
+		defer ticker.Stop()
+
+		// Run first scrape immediately
+		if err := scrapeAndSaveWithContext(allocCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		} else {
+			fmt.Printf("[+] Updated: %s\n", time.Now().Format("Mon Jan  2 15:04:05 UTC 2006"))
+		}
+
+		// Then run every interval
+		for range ticker.C {
+			if err := scrapeAndSaveWithContext(allocCtx); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			} else {
 				fmt.Printf("[+] Updated: %s\n", time.Now().Format("Mon Jan  2 15:04:05 UTC 2006"))
 			}
-			time.Sleep(time.Duration(*interval) * time.Second)
 		}
 	}()
 
 	// Wait for interrupt signal
 	<-sigChan
 	fmt.Println("\n[*] Shutting down...")
+	// Context cancellation will close Chrome browser
 }
 
 func scrapeAndSave() error {
 	domains, err := scrapeURLScan()
+	if err != nil {
+		return fmt.Errorf("failed to scrape: %w", err)
+	}
+
+	if err := saveDomains(domains); err != nil {
+		return fmt.Errorf("failed to save domains: %w", err)
+	}
+
+	return nil
+}
+
+func scrapeAndSaveWithContext(ctx context.Context) error {
+	domains, err := scrapeURLScanWithContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to scrape: %w", err)
 	}
@@ -98,6 +135,35 @@ func scrapeURLScan() ([]string, error) {
 
 	// Navigate and wait for selector
 	err := chromedp.Run(ctx,
+		chromedp.Navigate("https://urlscan.io"),
+		chromedp.WaitVisible("td.break-all.url a", chromedp.ByQuery),
+		chromedp.OuterHTML("html", &htmlContent),
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to load page: %w", err)
+	}
+
+	// Parse HTML and extract domains
+	domains := extractDomains(htmlContent)
+	return domains, nil
+}
+
+func scrapeURLScanWithContext(allocCtx context.Context) ([]string, error) {
+	// Create a new Chrome context (browser tab) for this scrape
+	chromeCtx, cancelChrome := chromedp.NewContext(allocCtx, chromedp.WithLogf(func(format string, v ...interface{}) {
+		// Suppress chromedp logs
+	}))
+	defer cancelChrome()
+
+	// Create timeout context for this specific scrape operation
+	scrapeCtx, cancel := context.WithTimeout(chromeCtx, time.Duration(*timeout)*time.Second)
+	defer cancel()
+
+	var htmlContent string
+
+	// Navigate and wait for selector (using new tab, browser process stays open)
+	err := chromedp.Run(scrapeCtx,
 		chromedp.Navigate("https://urlscan.io"),
 		chromedp.WaitVisible("td.break-all.url a", chromedp.ByQuery),
 		chromedp.OuterHTML("html", &htmlContent),
