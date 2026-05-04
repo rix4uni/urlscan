@@ -17,7 +17,7 @@ A Go-based tool to scrape recent scans from [urlscan.io](https://urlscan.io) and
 If you have Go installed, you can install directly from this repository:
 
 ```bash
-go install urlscan@latest
+go install github.com/rix4uni/urlscan@latest
 ```
 
 Or clone and build:
